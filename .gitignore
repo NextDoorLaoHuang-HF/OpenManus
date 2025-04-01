@@ -197,3 +197,4 @@ cython_debug/
 
 # OSX
 .DS_Store
+config/mcp_servers.json

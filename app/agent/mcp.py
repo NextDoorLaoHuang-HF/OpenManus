@@ -27,7 +27,7 @@ class MCPAgent(ToolCallAgent):
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
     available_tools: MCPClients = None  # Will be set in initialize()
 
-    max_steps: int = 20
+    max_steps: int = 10
     connection_type: str = "stdio"  # "stdio" or "sse"
 
     # Track tool schemas to detect changes
@@ -148,8 +148,54 @@ class MCPAgent(ToolCallAgent):
                 self.state = AgentState.FINISHED
                 return False
 
-        # Use the parent class's think method
-        return await super().think()
+        # Use the parent class's think method to get LLM response and tool calls
+        should_continue = await super().think()
+
+        # Check for TASK_COMPLETE signal regardless of tool calls
+        completion_signal = "TASK_COMPLETE"
+        if self.memory.messages:
+            last_message = self.memory.messages[-1]
+            # --- Add detailed logging before the check ---
+            logger.debug(
+                f"Checking for completion signal. should_continue={should_continue}"
+            )
+            if last_message.role == "assistant" and last_message.content:
+                content_stripped = last_message.content.strip()
+                contains_signal = completion_signal in content_stripped
+                logger.debug(f"Last message role: {last_message.role}")
+                logger.debug(
+                    f"Last message content (raw): {repr(last_message.content)}"
+                )  # Use repr() to see hidden chars
+                logger.debug(
+                    f"Last message content (stripped): {repr(content_stripped)}"
+                )  # Use repr()
+                logger.debug(f"Completion signal: '{completion_signal}'")
+                logger.debug(f"Signal found in stripped content? {contains_signal}")
+
+                # --- Existing Check: Use 'in' on stripped content ---
+                if contains_signal:
+                    logger.info(
+                        f"LLM indicated task completion via content signal: '{completion_signal}' found in content."
+                    )
+                    self.state = AgentState.FINISHED
+                    logger.debug(
+                        f"State set to: {self.state}. Returning False."
+                    )  # Log state change
+                    # Ensure we return False to stop the loop
+                    return False
+                else:
+                    logger.debug("Completion signal check failed.")  # Log failure
+            else:
+                logger.debug(
+                    "Last message not from assistant or no content."
+                )  # Log reason for skipping check
+        # --- End detailed logging ---
+
+        # Return the original continuation status determined by super().think()
+        logger.debug(
+            f"Think method returning should_continue={should_continue}"
+        )  # Log return value
+        return should_continue
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs) -> None:
         """Handle special tool execution and state changes"""

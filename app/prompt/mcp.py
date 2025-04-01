@@ -18,6 +18,11 @@ Follow these guidelines:
 - If multiple tools need to be called in sequence, make one call at a time and wait for results
 
 Remember to clearly explain your reasoning and actions to the user.
+
+**Task Completion:**
+- If you determine that the user's task is fully completed, first check if a 'terminate' tool (or similar) is available in the current tool list.
+- If a 'terminate' tool exists, call it to signal completion.
+- If no suitable termination tool is available, and you are certain the task is complete, respond with your final summary and include the exact phrase "TASK_COMPLETE" at the end of your response content. Do **not** call any other tools in this final step. The system will recognize this signal and end the process.
 """
 
 NEXT_STEP_PROMPT = """Based on the current state and available tools, what should be done next?
