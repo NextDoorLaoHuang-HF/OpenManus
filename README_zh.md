@@ -10,6 +10,19 @@
 [![Discord Follow](https://dcbadge.vercel.app/api/server/DYn29wFk9z?style=flat)](https://discord.gg/DYn29wFk9z)
 [![Demo](https://img.shields.io/badge/Demo-Hugging%20Face-yellow)](https://huggingface.co/spaces/lyh-917/OpenManusDemo)
 
+# 增强内容
+
+1. 工具调用不再依赖 OpenAI SDK。相反，它默认使用提示工程来请求模型使用 XML 格式进行工具调用，并进行相应的解析，从而提高使用开源模型的成功率。
+2. 整合了 MCP 和 Flow 实现，支持多 MCP 服务器的计划和利用。在创建计划之前，它会遍历配置文件中的所有 MCP 服务器，为每个服务器初始化一个 MCPAgent，为 FlowFactory 提供相关信息，并为每个步骤指定一个 MCPAgent执行。
+3. 每个 MCPAgent 可以配置使用特定的模型。例如，使用视觉模型与 Playwright 进行浏览器控制，可以提高成功率。
+
+# 增强的启动方法
+
+```bash
+python run_flow_multimcp.py
+```
+
+
 # 👋 OpenManus
 
 Manus 非常棒，但 OpenManus 无需邀请码即可实现任何创意 🛫！

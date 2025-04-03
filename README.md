@@ -10,6 +10,19 @@ English | [中文](README_zh.md) | [한국어](README_ko.md) | [日本語](READM
 [![Discord Follow](https://dcbadge.vercel.app/api/server/DYn29wFk9z?style=flat)](https://discord.gg/DYn29wFk9z)
 [![Demo](https://img.shields.io/badge/Demo-Hugging%20Face-yellow)](https://huggingface.co/spaces/lyh-917/OpenManusDemo)
 
+# Key Enhancements
+
+1. Tool invocation no longer relies on OpenAI SDK. Instead, it defaults to using prompt engineering to request models to use XML format for tool calling and parsing, improving success rates with open-source models.
+2. Integration of MCP and Flow implementations, supporting planning and utilization of multiple MCP servers. Before creating plans, it traverses all configured MCP servers in the configuration file, initializes an MCPAgent for each server, provides relevant information to FlowFactory for plan creation, and specifies which MCPAgent executes each step.
+3. Each MCPAgent can be configured to use specific models. For example, using vision models with Playwright for browser control can improve success rates.
+
+# Enhanced Startup Method
+
+```bash
+python run_flow_multimcp.py
+```
+
+
 # 👋 OpenManus
 
 Manus is incredible, but OpenManus can achieve any idea without an *Invite Code* 🛫!
