@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import AsyncExitStack
 from typing import List, Optional
@@ -23,6 +24,15 @@ class MCPClientTool(BaseTool):
             return ToolResult(error="Not connected to MCP server")
 
         try:
+            # 确保kwargs是字典类型
+            if isinstance(kwargs, str):
+                import json
+
+                try:
+                    kwargs = json.loads(kwargs)
+                except json.JSONDecodeError:
+                    return ToolResult(error=f"Invalid JSON in arguments: {kwargs}")
+
             result = await self.session.call_tool(self.name, kwargs)
             content_str = ", ".join(
                 item.text for item in result.content if isinstance(item, TextContent)
@@ -105,8 +115,27 @@ class MCPClients(ToolCollection):
     async def disconnect(self) -> None:
         """Disconnect from the MCP server and clean up resources."""
         if self.session and self.exit_stack:
-            await self.exit_stack.aclose()
+            # 首先清理会话和工具引用，确保即使exit_stack.aclose()失败也能释放资源
+            session_copy = self.session
+            exit_stack_copy = self.exit_stack
+
+            # 立即清空引用，防止其他地方继续使用
             self.session = None
             self.tools = tuple()
             self.tool_map = {}
-            logger.info("Disconnected from MCP server")
+
+            try:
+                # 直接关闭exit_stack，不使用独立任务，避免cancel scope问题
+                try:
+                    await exit_stack_copy.aclose()
+                    logger.info("Disconnected from MCP server")
+                except asyncio.CancelledError:
+                    logger.warning("MCP disconnect was cancelled during aclose")
+                except RuntimeError as re:
+                    # 捕获cancel scope相关的RuntimeError
+                    logger.error(f"RuntimeError during MCP disconnect: {re}")
+            except Exception as e:
+                logger.error(f"Error during MCP disconnect: {e}")
+            finally:
+                # 确保资源被释放
+                logger.info("MCP resources have been released")

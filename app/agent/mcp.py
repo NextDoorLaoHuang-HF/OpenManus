@@ -1,3 +1,5 @@
+import asyncio
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import Field
@@ -27,6 +29,9 @@ class MCPAgent(ToolCallAgent):
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
     available_tools: MCPClients = None  # Will be set in initialize()
 
+    # 存储服务器配置信息，用于延迟初始化
+    server_config: dict = Field(default_factory=dict)
+
     max_steps: int = 10
     connection_type: str = "stdio"  # "stdio" or "sse"
 
@@ -37,52 +42,135 @@ class MCPAgent(ToolCallAgent):
     # Special tool names that should trigger termination
     special_tool_names: List[str] = Field(default_factory=lambda: ["terminate"])
 
+    async def pre_initialize(
+        self,
+        connection_type: Optional[str] = None,
+        server_url: Optional[str] = None,
+        command: Optional[str] = None,
+        args: Optional[List[str]] = None,
+        env: Optional[dict] = None,
+        model_config: Optional[dict] = None,
+    ) -> None:
+        """预初始化MCP连接，获取能力信息后断开连接。
+
+        此方法用于规划阶段，只获取MCP服务器的能力信息，不保持长连接。
+
+        Args:
+            connection_type: 连接类型 ("stdio" 或 "sse")
+            server_url: MCP服务器URL (用于SSE连接)
+            command: 要运行的命令 (用于stdio连接)
+            args: 命令的参数 (用于stdio连接)
+            env: 环境变量 (用于stdio连接)
+            model_config: 模型配置 (用于指定使用的LLM模型)
+        """
+        # 存储配置信息，用于后续完整初始化
+        self.server_config = {
+            "connection_type": connection_type or self.connection_type,
+            "server_url": server_url,
+            "command": command,
+            "args": args or [],
+            "env": env or {},
+            "model_config": model_config or {},
+        }
+
+        # 设置环境变量
+        if env:
+            for key, value in env.items():
+                os.environ[key] = value
+
+        # 临时连接到MCP服务器获取能力信息
+        try:
+            logger.info(f"预初始化MCP代理: {self.name}")
+
+            # 根据连接类型连接到MCP服务器
+            if connection_type:
+                self.connection_type = connection_type
+
+            if self.connection_type == "sse":
+                if not server_url:
+                    raise ValueError("SSE连接需要提供服务器URL")
+                await self.mcp_clients.connect_sse(server_url=server_url)
+            elif self.connection_type == "stdio":
+                if not command:
+                    raise ValueError("stdio连接需要提供命令")
+                await self.mcp_clients.connect_stdio(command=command, args=args or [])
+            else:
+                raise ValueError(f"不支持的连接类型: {self.connection_type}")
+
+            # 设置可用工具
+            self.available_tools = self.mcp_clients
+
+            # 合成描述信息
+            await self._synthesize_description()
+
+            # 刷新工具列表
+            await self._refresh_tools()
+
+            logger.info(f"MCP代理预初始化完成: {self.name}")
+        finally:
+            # 无论成功与否，都断开连接
+            await self.cleanup()
+            logger.info(f"MCP代理预初始化后断开连接: {self.name}")
+
     async def initialize(
         self,
         connection_type: Optional[str] = None,
         server_url: Optional[str] = None,
         command: Optional[str] = None,
         args: Optional[List[str]] = None,
+        model_config: Optional[dict] = None,
     ) -> None:
-        """Initialize the MCP connection.
+        """完全初始化MCP连接。
 
         Args:
-            connection_type: Type of connection to use ("stdio" or "sse")
-            server_url: URL of the MCP server (for SSE connection)
-            command: Command to run (for stdio connection)
-            args: Arguments for the command (for stdio connection)
+            connection_type: 连接类型 ("stdio" 或 "sse")
+            server_url: MCP服务器URL (用于SSE连接)
+            command: 要运行的命令 (用于stdio连接)
+            args: 命令的参数 (用于stdio连接)
+            model_config: 模型配置 (用于指定使用的LLM模型)
         """
         if connection_type:
             self.connection_type = connection_type
 
-        # Connect to the MCP server based on connection type
+        # 如果提供了模型配置，使用指定的模型初始化LLM
+        if model_config and model_config.get("model"):
+            # 使用服务器名称作为配置名称，并创建新的LLM实例
+            self.llm = LLM(
+                config_name=self.name.lower(), llm_config={"default": model_config}
+            )
+            logger.info(
+                f"为MCP代理 {self.name} 使用自定义模型: {model_config.get('model')}"
+            )
+
+        # 根据连接类型连接到MCP服务器
         if self.connection_type == "sse":
             if not server_url:
-                raise ValueError("Server URL is required for SSE connection")
+                raise ValueError("SSE连接需要提供服务器URL")
             await self.mcp_clients.connect_sse(server_url=server_url)
         elif self.connection_type == "stdio":
             if not command:
-                raise ValueError("Command is required for stdio connection")
+                raise ValueError("stdio连接需要提供命令")
             await self.mcp_clients.connect_stdio(command=command, args=args or [])
         else:
-            raise ValueError(f"Unsupported connection type: {self.connection_type}")
+            raise ValueError(f"不支持的连接类型: {self.connection_type}")
 
-        # Set available_tools to our MCP instance
+        # 设置可用工具
         self.available_tools = self.mcp_clients
 
+        # 合成描述信息
+        await self._synthesize_description()
+
         # Store initial tool schemas
-        await self._refresh_tools()
+        await self._refresh_tools()  # _refresh_tools also updates self.tool_schemas
 
-        # Add system message about available tools
+        # Add system message about available tools AND the agent's (potentially updated) description
         tool_names = list(self.mcp_clients.tool_map.keys())
-        tools_info = ", ".join(tool_names)
+        tools_info = ", ".join(tool_names) if tool_names else "No tools reported."
 
-        # Add system prompt and available tools information
-        self.memory.add_message(
-            Message.system_message(
-                f"{self.system_prompt}\n\nAvailable MCP tools: {tools_info}"
-            )
-        )
+        # Construct the final system message including the potentially synthesized description
+        system_message_content = f"{self.system_prompt}\n\nAgent Description: {self.description}\n\nAvailable MCP tools: {tools_info}"
+
+        self.memory.add_message(Message.system_message(system_message_content))
 
     async def _refresh_tools(self) -> Tuple[List[str], List[str]]:
         """Refresh the list of available tools from the MCP server.
@@ -215,17 +303,64 @@ class MCPAgent(ToolCallAgent):
         # Terminate if the tool name is 'terminate'
         return name.lower() == "terminate"
 
+    async def _synthesize_description(self) -> None:
+        """从MCP服务器的工具中合成代理描述。"""
+        if self.mcp_clients.tool_map:
+            tool_descriptions = []
+            for tool_name, tool_instance in self.mcp_clients.tool_map.items():
+                # 使用MCP服务器提供的工具描述
+                desc = getattr(tool_instance, "description", "No description provided")
+                tool_descriptions.append(f"{tool_name}: {desc}")
+
+            if tool_descriptions:
+                synthesized_description = (
+                    "An agent connected to an MCP server providing the following tools:\n- "
+                    + "\n- ".join(tool_descriptions)
+                )
+                self.description = synthesized_description
+                logger.info(
+                    f"Synthesized description for {self.name} based on MCP tools."
+                )
+            else:
+                logger.warning(
+                    f"MCP server for {self.name} reported tools, but failed to generate descriptions. Using default."
+                )
+        else:
+            logger.warning(
+                f"No tools found on MCP server for {self.name}. Using default description: '{self.description}'"
+            )
+
     async def cleanup(self) -> None:
         """Clean up MCP connection when done."""
         if self.mcp_clients.session:
-            await self.mcp_clients.disconnect()
-            logger.info("MCP connection closed")
+            try:
+                # 添加超时机制，避免无限等待
+                await asyncio.wait_for(self.mcp_clients.disconnect(), timeout=5.0)
+                logger.info("MCP connection closed")
+            except asyncio.TimeoutError:
+                logger.warning("MCP cleanup timed out after 5 seconds, forcing cleanup")
+                # 确保资源被释放
+                self.mcp_clients.session = None
+                self.mcp_clients.tools = tuple()
+                self.mcp_clients.tool_map = {}
+            except asyncio.exceptions.CancelledError:
+                logger.warning("MCP cleanup was cancelled, forcing resource release")
+                # 确保资源被释放
+                self.mcp_clients.session = None
+                self.mcp_clients.tools = tuple()
+                self.mcp_clients.tool_map = {}
+            except Exception as e:
+                logger.error(f"Error during MCP cleanup: {e}")
+                # 确保资源被释放
+                self.mcp_clients.session = None
+                self.mcp_clients.tools = tuple()
+                self.mcp_clients.tool_map = {}
 
     async def run(self, request: Optional[str] = None) -> str:
-        """Run the agent with cleanup when done."""
-        try:
-            result = await super().run(request)
-            return result
-        finally:
-            # Ensure cleanup happens even if there's an error
-            await self.cleanup()
+        """Run the agent without automatic cleanup to maintain connection for multi-step execution.
+
+        The cleanup will be handled by the flow after all steps are completed.
+        """
+        # 不再在每次run后自动调用cleanup，避免连接提前关闭
+        result = await super().run(request)
+        return result

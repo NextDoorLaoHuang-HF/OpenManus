@@ -7,7 +7,17 @@
                 "@amap/amap-maps-mcp-server"
             ],
             "env": {
-                "AMAP_MAPS_API_KEY": "您在高德官网上申请的key"
+                "AMAP_MAPS_API_KEY": "高德官网申请的key"
+            }
+        },
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "@playwright/mcp@latest",
+                "--vision"
+            ],
+            "model_config": {
+                "model": "gpt-4o"
             }
         }
     }

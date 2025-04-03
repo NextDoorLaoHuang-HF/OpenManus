@@ -1,4 +1,5 @@
 """Collection classes for managing multiple tools."""
+
 from typing import Any, Dict, List
 
 from app.exceptions import ToolError
@@ -28,6 +29,17 @@ class ToolCollection:
         if not tool:
             return ToolFailure(error=f"Tool {name} is invalid")
         try:
+            # 确保tool_input是字典类型
+            if isinstance(tool_input, str):
+                import json
+
+                try:
+                    tool_input = json.loads(tool_input)
+                except json.JSONDecodeError:
+                    return ToolFailure(
+                        error=f"Invalid JSON in tool_input: {tool_input}"
+                    )
+
             result = await tool(**tool_input)
             return result
         except ToolError as e:

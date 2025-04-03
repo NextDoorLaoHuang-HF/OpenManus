@@ -11,7 +11,6 @@ from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
 
-
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
 
 
@@ -175,6 +174,14 @@ class ToolCallAgent(ReActAgent):
         try:
             # Parse arguments
             args = json.loads(command.function.arguments or "{}")
+
+            # 检查参数是否为字符串，如果是则尝试解析为JSON
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to parse arguments string: {args}")
+                    return f"Error: Invalid JSON format in arguments: {args}"
 
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")

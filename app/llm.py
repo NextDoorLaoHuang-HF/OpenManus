@@ -1,5 +1,7 @@
 import math
-from typing import Dict, List, Optional, Union
+import re
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Optional, Tuple, Union
 
 import tiktoken
 from openai import (
@@ -29,7 +31,6 @@ from app.schema import (
     Message,
     ToolChoice,
 )
-
 
 REASONING_MODELS = ["o1", "o3-mini"]
 MULTIMODAL_MODELS = [
@@ -429,8 +430,15 @@ class LLM:
                     **params, stream=False
                 )
 
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
+                # Check if response is valid
+                if (
+                    not response.choices
+                    or not response.choices[0].message
+                    or not response.choices[0].message.content
+                ):
+                    logger.error(f"LLM返回无效或空响应 (non-streaming): {response}")
+                    # Instead of raising ValueError, return an empty string or handle appropriately
+                    return ""  # Return empty string to signify no valid content
 
                 # Update token counts
                 self.update_token_count(
@@ -455,7 +463,10 @@ class LLM:
             print()  # Newline after streaming
             full_response = "".join(collected_messages).strip()
             if not full_response:
-                raise ValueError("Empty response from streaming LLM")
+                # Log the error but don't raise ValueError immediately for streaming
+                logger.error("LLM返回空的流式响应")
+                # Return empty string if streaming resulted in no content
+                return ""
 
             # estimate completion tokens for streaming response
             completion_tokens = self.count_tokens(completion_text)
@@ -544,9 +555,7 @@ class LLM:
             multimodal_content = (
                 [{"type": "text", "text": content}]
                 if isinstance(content, str)
-                else content
-                if isinstance(content, list)
-                else []
+                else content if isinstance(content, list) else []
             )
 
             # Add images to content
@@ -648,6 +657,228 @@ class LLM:
             (OpenAIError, Exception, ValueError)
         ),  # Don't retry TokenLimitExceeded
     )
+    def _parse_xml_tool_call(self, content: str) -> List[dict]:
+        """
+        Parse XML-formatted tool calls from model response.
+
+        Args:
+            content: The text response from the model containing XML tool calls
+
+        Returns:
+            List of parsed tool calls in OpenAI-compatible format
+
+        Example XML format:
+            <tool_calls>
+                <tool_call>
+                    <name>function_name</name>
+                    <arguments>{"arg1": "value1", "arg2": "value2"}</arguments>
+                </tool_call>
+            </tool_calls>
+        """
+        tool_calls = []
+
+        # Try multiple patterns to extract tool calls
+        # Pattern 1: Standard <tool_calls> wrapper
+        tool_calls_match = re.search(
+            r"<tool_calls>(.*?)</tool_calls>", content, re.DOTALL
+        )
+
+        if tool_calls_match:
+            try:
+                # Parse the XML content
+                xml_content = f"<tool_calls>{tool_calls_match.group(1)}</tool_calls>"
+                root = ET.fromstring(xml_content)
+
+                # Process each tool_call element
+                for i, tool_call_elem in enumerate(root.findall("./tool_call")):
+                    name_elem = tool_call_elem.find("./name")
+                    args_elem = tool_call_elem.find("./arguments")
+
+                    if name_elem is not None and args_elem is not None:
+                        # Create a tool call in OpenAI format
+                        tool_call = {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": name_elem.text or "",
+                                "arguments": args_elem.text or "{}",
+                            },
+                        }
+                        tool_calls.append(tool_call)
+            except ET.ParseError as e:
+                logger.error(f"XML parsing error with standard pattern: {e}")
+            except Exception as e:
+                logger.error(f"Error parsing XML tool calls with standard pattern: {e}")
+
+        # If no tool calls found with the standard pattern, try alternative patterns
+        if not tool_calls:
+            # Pattern 2: Individual <tool_call> tags without wrapper
+            tool_call_matches = re.finditer(
+                r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
+                content,
+                re.DOTALL,
+            )
+
+            for i, match in enumerate(tool_call_matches):
+                try:
+                    name = match.group(1).strip()
+                    arguments = match.group(2).strip()
+
+                    # Create a tool call in OpenAI format
+                    tool_call = {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments or "{}",
+                        },
+                    }
+                    tool_calls.append(tool_call)
+                except Exception as e:
+                    logger.error(f"Error parsing individual tool call: {e}")
+
+        # Pattern 3: Try to extract from code blocks if no XML tags found
+        if not tool_calls:
+            # Look for code blocks that might contain tool calls
+            code_block_matches = re.finditer(
+                r"```(?:xml)?\s*<tool_call[s]?>(.*?)```", content, re.DOTALL
+            )
+
+            for match in code_block_matches:
+                try:
+                    code_content = match.group(1).strip()
+                    # Try to parse as XML
+                    xml_content = f"<tool_calls>{code_content}</tool_calls>"
+                    parsed_calls = self._parse_xml_tool_call(xml_content)
+                    if parsed_calls:
+                        tool_calls.extend(parsed_calls)
+                except Exception as e:
+                    logger.error(f"Error parsing code block as tool call: {e}")
+
+        return tool_calls
+
+    def _create_xml_prompt(self, tools: List[dict]) -> str:
+        """
+        Create a system prompt that instructs the model to use XML format for tool calls.
+
+        Args:
+            tools: List of tool definitions
+
+        Returns:
+            A system prompt string
+        """
+        tool_descriptions = []
+
+        for tool in tools:
+            if tool.get("type") == "function" and "function" in tool:
+                function = tool["function"]
+                name = function.get("name", "")
+                description = function.get("description", "")
+                parameters = function.get("parameters", {})
+
+                # Format parameters as a simplified schema
+                param_desc = ""
+                if "properties" in parameters:
+                    properties = parameters["properties"]
+                    required = parameters.get("required", [])
+
+                    for param_name, param_info in properties.items():
+                        is_required = (
+                            "(required)" if param_name in required else "(optional)"
+                        )
+                        param_type = param_info.get("type", "any")
+                        param_description = param_info.get("description", "")
+                        param_desc += f"- {param_name} {is_required}: {param_type} - {param_description}\n"
+
+                tool_descriptions.append(
+                    f"### {name}\n"
+                    f"Description: {description}\n"
+                    f"Parameters:\n{param_desc}"
+                )
+
+        tools_text = "\n\n".join(tool_descriptions)
+
+        return (
+            "IMPORTANT: When you need to use a tool, you MUST respond with the tool call in XML format as follows:\n"
+            "<tool_calls>\n"
+            "  <tool_call>\n"
+            "    <name>tool_name</name>\n"
+            '    <arguments>{"arg1": "value1", "arg2": "value2"}</arguments>\n'
+            "  </tool_call>\n"
+            "</tool_calls>\n\n"
+            "The arguments MUST be a valid JSON string. Ensure all quotes are properly escaped.\n\n"
+            "You can include your regular response before or after the tool call XML block.\n\n"
+            "Available tools:\n"
+            f"{tools_text}\n\n"
+            "REMEMBER: Always use the exact XML format shown above when calling tools. "
+            "Do not modify the XML tags or structure."
+        )
+
+    async def _ask_tool_xml(
+        self,
+        messages: List[Union[dict, Message]],
+        tools: List[dict],
+        system_msgs: Optional[List[Union[dict, Message]]] = None,
+        temperature: Optional[float] = None,
+        **kwargs,
+    ) -> Tuple[str, List[dict]]:
+        """
+        Ask LLM using XML-formatted tool calls for open-source models.
+
+        Args:
+            messages: List of conversation messages
+            tools: List of tools to use
+            system_msgs: Optional system messages to prepend
+            temperature: Sampling temperature for the response
+            **kwargs: Additional completion arguments
+
+        Returns:
+            Tuple of (raw_response, parsed_tool_calls)
+        """
+        # Create XML tool usage instructions
+        xml_prompt = self._create_xml_prompt(tools)
+
+        # Add XML instructions to system messages
+        if system_msgs:
+            # Add to existing system message if possible
+            has_system = False
+            for msg in system_msgs:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    if "content" in msg and msg["content"]:
+                        msg["content"] += "\n\n" + xml_prompt
+                    else:
+                        msg["content"] = xml_prompt
+                    has_system = True
+                    break
+                elif isinstance(msg, Message) and msg.role == "system":
+                    if msg.content:
+                        msg.content += "\n\n" + xml_prompt
+                    else:
+                        msg.content = xml_prompt
+                    has_system = True
+                    break
+
+            # If no system message found, add a new one
+            if not has_system:
+                system_msgs.append({"role": "system", "content": xml_prompt})
+        else:
+            # Create new system message
+            system_msgs = [{"role": "system", "content": xml_prompt}]
+
+        # Call the regular ask method
+        response = await self.ask(
+            messages=messages,
+            system_msgs=system_msgs,
+            stream=False,
+            temperature=temperature,
+            **kwargs,
+        )
+
+        # Parse XML tool calls from the response
+        tool_calls = self._parse_xml_tool_call(response)
+
+        return response, tool_calls
+
     async def ask_tool(
         self,
         messages: List[Union[dict, Message]],
@@ -656,6 +887,7 @@ class LLM:
         tools: Optional[List[dict]] = None,
         tool_choice: TOOL_CHOICE_TYPE = ToolChoice.AUTO,  # type: ignore
         temperature: Optional[float] = None,
+        use_xml_format: Optional[bool] = None,  # Parameter to control tool call format
         **kwargs,
     ) -> ChatCompletionMessage | None:
         """
@@ -668,6 +900,7 @@ class LLM:
             tools: List of tools to use
             tool_choice: Tool choice strategy
             temperature: Sampling temperature for the response
+            use_xml_format: Whether to use XML format for tool calls (None=auto-detect)
             **kwargs: Additional completion arguments
 
         Returns:
@@ -686,6 +919,39 @@ class LLM:
 
             # Check if the model supports images
             supports_images = self.model in MULTIMODAL_MODELS
+
+            # Determine whether to use XML format
+            # If use_xml_format is explicitly set, use that value
+            # Otherwise, use XML format for non-OpenAI models by default
+            if use_xml_format is None:
+                # Auto-detect based on model and API type
+                # Use XML format for non-OpenAI models or when specified API types
+                use_xml_format = self.api_type in [
+                    "aws",
+                    "ollama",
+                    "local",
+                ] or not self.model.startswith(("gpt-", "text-davinci-"))
+
+            # If using XML format, delegate to _ask_tool_xml method
+            if use_xml_format and tools:
+                raw_response, tool_calls = await self._ask_tool_xml(
+                    messages=messages,
+                    tools=tools,
+                    system_msgs=system_msgs,
+                    temperature=temperature,
+                    **kwargs,
+                )
+
+                # Create a ChatCompletionMessage-like response
+                # This mimics the structure of an OpenAI response for compatibility
+                if tool_calls:
+                    # Create a message with tool calls
+                    return ChatCompletionMessage(
+                        role="assistant", content=raw_response, tool_calls=tool_calls
+                    )
+                else:
+                    # Create a regular message without tool calls
+                    return ChatCompletionMessage(role="assistant", content=raw_response)
 
             # Format messages
             if system_msgs:
@@ -742,6 +1008,7 @@ class LLM:
 
             # Check if response is valid
             if not response.choices or not response.choices[0].message:
+                logger.error(f"LLM返回无效或空响应: {response}")
                 print(response)
                 # raise ValueError("Invalid or empty response from LLM")
                 return None
